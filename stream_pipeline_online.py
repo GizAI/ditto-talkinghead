@@ -1,3 +1,4 @@
+import os
 import threading
 import queue
 import numpy as np
@@ -12,6 +13,7 @@ from core.atomic_components.warp_f3d import WarpF3D
 from core.atomic_components.decode_f3d import DecodeF3D
 from core.atomic_components.putback import PutBack
 from core.atomic_components.writer import VideoWriterByImageIO
+from core.atomic_components.audio_video_writer import AudioVideoWriter
 from core.atomic_components.wav2feat import Wav2Feat
 from core.atomic_components.cfg import parse_cfg, print_cfg
 
@@ -93,7 +95,7 @@ class StreamSDK:
                 ctrl_info[i] = item
         self.ctrl_info = ctrl_info
 
-    def setup(self, source_path, output_path, **kwargs):
+    def setup(self, source_path, output_path, audio_path=None, **kwargs):
 
         # ======== Prepare Options ========
         kwargs = self._merge_kwargs(self.default_kwargs, kwargs)
@@ -218,8 +220,17 @@ class StreamSDK:
 
         # ======== Video Writer ========
         self.output_path = output_path
+        self.audio_path = audio_path
         self.tmp_output_path = output_path + ".tmp.mp4"
-        self.writer = VideoWriterByImageIO(self.tmp_output_path)
+
+        # Use AudioVideoWriter if audio_path is provided, otherwise use VideoWriterByImageIO
+        if audio_path and os.path.exists(audio_path):
+            print(f"🎵 Using AudioVideoWriter with audio: {audio_path}")
+            self.writer = AudioVideoWriter(output_path, audio_path)
+        else:
+            print(f"📹 Using VideoWriterByImageIO (video only)")
+            self.writer = VideoWriterByImageIO(self.tmp_output_path)
+
         self.writer_pbar = tqdm(desc="writer")
 
         # ======== Audio Feat Buffer ========
