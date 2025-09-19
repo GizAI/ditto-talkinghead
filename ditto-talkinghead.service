@@ -1,0 +1,27 @@
+[Unit]
+Description=Ditto TalkingHead API Service
+After=network.target
+
+[Service]
+Type=simple
+User=user
+Group=user
+WorkingDirectory=/home/user/ditto-talkinghead
+Environment=PATH=/home/user/miniconda3/envs/ditto/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CONDA_DEFAULT_ENV=ditto
+Environment=CONDA_PREFIX=/home/user/miniconda3/envs/ditto
+Environment=DITTO_PORT=8010
+Environment=CUDA_VISIBLE_DEVICES=0
+ExecStart=/home/user/miniconda3/envs/ditto/bin/python simple_audio_video_api.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ditto-talkinghead
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=8G
+
+[Install]
+WantedBy=multi-user.target
