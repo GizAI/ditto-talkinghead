@@ -4,14 +4,15 @@ Simple Audio+Video Streaming API
 Uses modified StreamSDK with built-in audio+video generation
 """
 
+import io
 import os
-import time
 import uuid
 import threading
 import asyncio
-from typing import Dict, Optional
+from contextlib import contextmanager
+from typing import Dict, Optional, Iterator
 import numpy as np
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 import librosa
 
@@ -21,17 +22,81 @@ os.environ.setdefault("FFMPEG_BINARY", "/usr/bin/ffmpeg")
 # Import modified Ditto SDK
 from stream_pipeline_online import StreamSDK
 
+
+class _SharedStreamSDKManager:
+    """Singleton-style helper to reuse a preloaded StreamSDK instance."""
+
+    def __init__(self, cfg_path: str, data_root: str):
+        self._cfg_path = cfg_path
+        self._data_root = data_root
+        self._sdk: Optional[StreamSDK] = None
+        self._lock = threading.Lock()
+        self._in_use = False
+        self._condition = threading.Condition(self._lock)
+        self._warmup_thread: Optional[threading.Thread] = None
+
+    def _ensure_initialized(self) -> StreamSDK:
+        if self._sdk is None:
+            # Heavy init happens once and is shared across sessions
+            self._sdk = StreamSDK(self._cfg_path, self._data_root)
+        return self._sdk
+
+    def ensure_background_warmup(self) -> None:
+        if self._sdk is not None:
+            return
+        if self._warmup_thread and self._warmup_thread.is_alive():
+            return
+
+        def _warmup() -> None:
+            try:
+                self._ensure_initialized()
+            except Exception as exc:
+                # Surface during actual acquire; log quietly otherwise
+                print(f"StreamSDK warmup failed: {exc}")
+
+        self._warmup_thread = threading.Thread(target=_warmup, daemon=True)
+        self._warmup_thread.start()
+
+    @contextmanager
+    def acquire(self) -> Iterator[StreamSDK]:
+        with self._condition:
+            while self._in_use:
+                self._condition.wait()
+            sdk = self._ensure_initialized()
+            self._in_use = True
+        try:
+            yield sdk
+        finally:
+            with self._condition:
+                self._in_use = False
+                self._condition.notify()
+
+
+_STREAM_SDK_MANAGER = _SharedStreamSDKManager(
+    "./checkpoints/ditto_cfg/v0.4_hubert_cfg_trt_online.pkl",
+    "./checkpoints/ditto_trt_Ampere_Plus",
+)
+# Kick off warmup without blocking startup.
+_STREAM_SDK_MANAGER.ensure_background_warmup()
+
 app = FastAPI(title="Simple Audio+Video Streaming API")
 
 # Global sessions storage
 sessions: Dict[str, "SimpleAVSession"] = {}
 
 class SimpleAVSession:
-    def __init__(self, session_id: str, source_image_path: str, audio_path: str):
+    def __init__(
+        self,
+        session_id: str,
+        source_image_path: str,
+        audio_path: str,
+        sdk_manager: _SharedStreamSDKManager,
+    ) -> None:
         self.session_id = session_id
         self.source_image_path = source_image_path
         self.audio_path = audio_path
-        
+        self._sdk_manager = sdk_manager
+
         # Output path (will contain audio+video)
         self.output_path = f"./tmp/av_{session_id}.mp4"
         
@@ -40,9 +105,11 @@ class SimpleAVSession:
         self.is_complete = False
         self.processed_frames = 0
         self.total_frames = 0
+        self._finalize_lock = threading.Lock()
+        self.final_path: Optional[str] = None
         
         # SDK
-        self.sdk = None
+        self.sdk: Optional[StreamSDK] = None
         
     def start_processing(self, audio: np.ndarray):
         """Start processing with built-in audio+video generation"""
@@ -51,94 +118,116 @@ class SimpleAVSession:
             
         self.is_processing = True
         self.total_frames = len(audio) // 640  # Estimate frames
-        
+
         # Start processing in background thread
         thread = threading.Thread(target=self._process_with_builtin_audio, args=(audio,))
         thread.daemon = True
         thread.start()
         
-    def _process_with_builtin_audio(self, audio: np.ndarray):
-        """Process video with built-in audio+video generation"""
-        try:
-            # Initialize SDK
-            self.sdk = StreamSDK(
-                "./checkpoints/ditto_cfg/v0.4_hubert_cfg_trt_online.pkl",
-                "./checkpoints/ditto_trt_Ampere_Plus"
-            )
-            
-            # Setup SDK with audio path for built-in audio+video generation
-            setup_kwargs = {
-                "online_mode": True,
-                "sampling_timesteps": 10,
-                "overlap_v2": 70,
-                "smo_k_d": 3,
-                "max_size": 1024,
-            }
-            
-            # Setup SDK with audio path for built-in audio+video generation
-            self.sdk.setup(self.source_image_path, self.output_path, audio_path=self.audio_path, **setup_kwargs)
-            
-            # Load audio and calculate total frames
-            import math
-            total_frames = math.ceil(len(audio) / 16000 * 25)
-            self.sdk.setup_Nd(N_d=total_frames)
-            
-            # Hook into writer with a proxy so close() still works
-            original_writer = self.sdk.writer
+    def ensure_finalized(self) -> Optional[str]:
+        if self.final_path and os.path.exists(self.final_path):
+            return self.final_path
 
-            class _ProgressWriterProxy:
-                def __init__(self, inner, session_ref, sdk_ref):
-                    self._inner = inner
-                    self._session = session_ref
-                    self._sdk = sdk_ref
+        if not self.is_complete:
+            return None
 
-                def __call__(self, frame, fmt="rgb"):
-                    self._session.processed_frames += 1
-                    if hasattr(self._inner, "__call__"):
-                        self._inner(frame, fmt)
+        with self._finalize_lock:
+            if self.final_path and os.path.exists(self.final_path):
+                return self.final_path
 
-                def close(self):
-                    if hasattr(self._inner, "close"):
-                        self._inner.close()
+            if not os.path.exists(self.output_path):
+                return None
 
-                def __getattr__(self, name):
-                    return getattr(self._inner, name)
-
-            self.sdk.writer = _ProgressWriterProxy(original_writer, self, self.sdk)
-            
-            # Process audio chunks
-            chunksize = (2, 3, 1)
-            audio = np.concatenate([np.zeros((chunksize[0] * 640,), dtype=np.float32), audio], 0)
-            split_len = int(sum(chunksize) * 0.04 * 16000) + 80
-            
-            for i in range(0, len(audio), chunksize[1] * 640):
-                audio_chunk = audio[i:i + split_len]
-                if len(audio_chunk) < split_len:
-                    audio_chunk = np.pad(audio_chunk, (0, split_len - len(audio_chunk)), mode="constant")
-                
-                self.sdk.run_chunk(audio_chunk, chunksize)
-            
-            # Close SDK (this will finalize the MP4 and stop ffmpeg live muxer)
-            try:
-                if hasattr(self.sdk, 'close'):
-                    self.sdk.close()
-            except Exception:
-                pass
-
-            # Remux a final MP4 for download with proper moov and duration
             try:
                 import subprocess
-                final_path = self.output_path.replace('.mp4', '.final.mp4')
+
+                candidate = self.output_path.replace('.mp4', '.final.mp4')
                 cmd = [
                     'ffmpeg', '-v', 'error', '-y',
                     '-i', self.output_path,
                     '-c', 'copy', '-movflags', '+faststart',
-                    final_path,
+                    candidate,
                 ]
                 subprocess.run(cmd, check=True)
-                self.final_path = final_path
+                self.final_path = candidate
             except Exception:
                 self.final_path = None
+
+        return self.final_path
+
+    def _process_with_builtin_audio(self, audio: np.ndarray):
+        """Process video with built-in audio+video generation"""
+        try:
+            setup_kwargs = {
+                "online_mode": True,
+                "sampling_timesteps": 50,
+                "overlap_v2": 70,
+                "smo_k_d": 3,
+                "max_size": 1024,
+            }
+
+            with self._sdk_manager.acquire() as sdk:
+                self.sdk = sdk
+
+                # Setup SDK with audio path for built-in audio+video generation
+                self.sdk.setup(
+                    self.source_image_path,
+                    self.output_path,
+                    audio_path=self.audio_path,
+                    **setup_kwargs,
+                )
+
+                # Load audio and calculate total frames
+                import math
+                total_frames = math.ceil(len(audio) / 16000 * 25)
+                self.sdk.setup_Nd(N_d=total_frames)
+                self.total_frames = total_frames
+
+                # Hook into writer with a proxy so close() still works
+                original_writer = self.sdk.writer
+
+                class _ProgressWriterProxy:
+                    def __init__(self, inner, session_ref, sdk_ref):
+                        self._inner = inner
+                        self._session = session_ref
+                        self._sdk = sdk_ref
+
+                    def __call__(self, frame, fmt="rgb"):
+                        self._session.processed_frames += 1
+                        if hasattr(self._inner, "__call__"):
+                            self._inner(frame, fmt)
+
+                    def close(self):
+                        if hasattr(self._inner, "close"):
+                            self._inner.close()
+
+                    def __getattr__(self, name):
+                        return getattr(self._inner, name)
+
+                self.sdk.writer = _ProgressWriterProxy(original_writer, self, self.sdk)
+
+                # Process audio chunks
+                chunksize = (2, 3, 1)
+                audio = np.concatenate(
+                    [np.zeros((chunksize[0] * 640,), dtype=np.float32), audio], 0
+                )
+                split_len = int(sum(chunksize) * 0.04 * 16000) + 80
+
+                for i in range(0, len(audio), chunksize[1] * 640):
+                    audio_chunk = audio[i:i + split_len]
+                    if len(audio_chunk) < split_len:
+                        audio_chunk = np.pad(
+                            audio_chunk, (0, split_len - len(audio_chunk)), mode="constant"
+                        )
+
+                    self.sdk.run_chunk(audio_chunk, chunksize)
+
+                # Close SDK (this will finalize the MP4 and stop ffmpeg live muxer)
+                try:
+                    if hasattr(self.sdk, 'close'):
+                        self.sdk.close()
+                except Exception:
+                    pass
 
             self.is_complete = True
 
@@ -146,6 +235,7 @@ class SimpleAVSession:
             print(f"Error in audio+video processing: {e}")
         finally:
             self.is_processing = False
+            self.sdk = None
 
 @app.get("/", response_class=HTMLResponse)
 async def get_client():
@@ -249,9 +339,9 @@ async def get_client():
                         } else if (status.is_processing) {
                             document.getElementById('statusText').textContent = 'Generating audio+video...';
 
-                            // Start streaming as soon as we have some content (after ~5 frames)
+                            // Start streaming as soon as we have some content (after ~1 frame)
                             console.log('Status:', status.processed_frames, 'frames, streamStarted:', window.streamStarted);
-                            if (status.processed_frames >= 5 && !window.streamStarted) {
+                            if (status.processed_frames >= 1 && !window.streamStarted) {
                                 window.streamStarted = true;
                                 const videoUrl = `/api/stream_simple/${currentSessionId}`;
                                 window.open(videoUrl, '_blank');
@@ -265,7 +355,7 @@ async def get_client():
                     } catch (error) {
                         console.error('Status error:', error);
                     }
-                }, 1000);
+                }, 500);
             }
         </script>
     </body>
@@ -288,17 +378,20 @@ async def create_simple_session(
     source_image_path = f"./tmp/source_{session_id}.jpg"
     audio_path = f"./tmp/audio_{session_id}.wav"
     
+    source_bytes = await source_image.read()
     with open(source_image_path, "wb") as f:
-        f.write(await source_image.read())
-    
+        f.write(source_bytes)
+
+    audio_bytes = await audio_file.read()
     with open(audio_path, "wb") as f:
-        f.write(await audio_file.read())
+        f.write(audio_bytes)
     
     # Load audio
-    audio, sr = librosa.load(audio_path, sr=16000)
+    audio_buffer = io.BytesIO(audio_bytes)
+    audio, sr = librosa.load(audio_buffer, sr=16000)
     
     # Create session
-    session = SimpleAVSession(session_id, source_image_path, audio_path)
+    session = SimpleAVSession(session_id, source_image_path, audio_path, _STREAM_SDK_MANAGER)
     sessions[session_id] = session
     
     # Start processing
@@ -335,8 +428,10 @@ async def stream_simple(session_id: str, request: Request):
     session = sessions[session_id]
 
     # Parse Range header if present (e.g., bytes=12345-)
-    # Ignore Range to keep connection open and stream as file grows
-    range_header = None
+    range_header = request.headers.get('range')
+    if range_header and not session.is_complete:
+        # Live sessions keep the connection open; browsers fall back to progressive streaming.
+        range_header = None
     range_start = 0
     range_end_requested: Optional[int] = None
     if range_header and range_header.startswith('bytes='):
@@ -351,21 +446,23 @@ async def stream_simple(session_id: str, request: Request):
             range_start = 0
             range_end_requested = None
 
-    # streaming started
-
     # If a Range request is present, comply with 206 responses so browsers can buffer correctly.
     if range_header:
+        serve_path = session.ensure_finalized() or session.output_path
+        if not os.path.exists(serve_path):
+            raise HTTPException(status_code=404, detail="File not ready")
+
         async def _wait_for_bytes(min_size: int) -> int:
             while True:
-                if os.path.exists(session.output_path):
-                    current_size = os.path.getsize(session.output_path)
+                if os.path.exists(serve_path):
+                    current_size = os.path.getsize(serve_path)
                     if current_size > min_size:
                         return current_size
                     if session.is_complete and current_size >= min_size:
                         return current_size
-                if session.is_complete and not os.path.exists(session.output_path):
+                if session.is_complete and not os.path.exists(serve_path):
                     return 0
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)  # Check more frequently
 
         available_size = await _wait_for_bytes(range_start)
         if available_size <= range_start:
@@ -381,10 +478,10 @@ async def stream_simple(session_id: str, request: Request):
         bytes_to_send = range_end - range_start + 1
 
         def ranged_stream():
-            with open(session.output_path, 'rb') as f:
+            with open(serve_path, 'rb') as f:
                 f.seek(range_start)
                 remaining = bytes_to_send
-                chunk_size = 64 * 1024
+                chunk_size = 8 * 1024  # Smaller chunks for faster streaming
                 while remaining > 0:
                     chunk = f.read(min(chunk_size, remaining))
                     if not chunk:
@@ -392,7 +489,7 @@ async def stream_simple(session_id: str, request: Request):
                     remaining -= len(chunk)
                     yield chunk
 
-        total_size_header = os.path.getsize(session.output_path) if session.is_complete and os.path.exists(session.output_path) else '*'
+        total_size_header = os.path.getsize(serve_path) if os.path.exists(serve_path) else '*'
         headers = {
             "Accept-Ranges": "bytes",
             "Cache-Control": "no-cache",
@@ -411,31 +508,30 @@ async def stream_simple(session_id: str, request: Request):
     # Fallback: progressive streaming without Range; keep connection open for live growth.
     def generate_realtime_stream():
         import time as _time
+        min_start_bytes = 128
+        while not os.path.exists(session.output_path) or os.path.getsize(session.output_path) < min_start_bytes:
+            _time.sleep(0.05)  # Wait until ffmpeg emits initial fragment
+
         last_size = 0
-        while not os.path.exists(session.output_path) or os.path.getsize(session.output_path) < 1024:
-            _time.sleep(0.1)
-        while True:
-            try:
-                current_size = os.path.getsize(session.output_path)
-                if current_size > last_size:
-                    with open(session.output_path, 'rb') as f:
-                        f.seek(last_size)
-                        chunk = f.read(current_size - last_size)
-                        if chunk:
-                            yield chunk
-                            last_size = current_size
-                if session.is_complete:
-                    with open(session.output_path, 'rb') as f:
-                        f.seek(last_size)
-                        tail = f.read()
-                        if tail:
-                            yield tail
-                    break
-                _time.sleep(0.1)
-            except Exception as e:
-                # swallow transient streaming errors; client may close early
-                break
-                break
+        try:
+            with open(session.output_path, 'rb') as stream_file:
+                while True:
+                    stream_file.seek(last_size)
+                    chunk = stream_file.read()
+                    if chunk:
+                        last_size += len(chunk)
+                        yield chunk
+                        continue
+
+                    if session.is_complete:
+                        current_size = os.path.getsize(session.output_path)
+                        if current_size <= last_size:
+                            break
+
+                    _time.sleep(0.05)
+        except Exception:
+            # swallow transient streaming errors; client may close early
+            return
 
     headers = {
         "Accept-Ranges": "bytes",
@@ -457,8 +553,8 @@ async def download_simple(session_id: str):
 
     session = sessions[session_id]
 
-    # Prefer the remuxed final file if available; fallback to the live fragmented file
-    final_path = getattr(session, 'final_path', None)
+    # Prefer a remuxed MP4 with faststart; create on-demand if missing.
+    final_path = session.ensure_finalized()
     serve_path = final_path if final_path and os.path.exists(final_path) else session.output_path
 
     if not os.path.exists(serve_path):
@@ -472,10 +568,17 @@ async def download_simple(session_id: str):
 
 if __name__ == "__main__":
     import uvicorn
+
+    # Get configuration from environment variables
+    port = int(os.environ.get("DITTO_PORT", "8010"))
+    gpu_id = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+
+    print(f"Starting Ditto TalkingHead API on port {port} with GPU {gpu_id}")
+
     uvicorn.run(
         "simple_audio_video_api:app",
         host="0.0.0.0",
-        port=8010,
+        port=port,
         reload=False,
         workers=1
     )

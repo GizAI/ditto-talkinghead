@@ -1,10 +1,12 @@
 import os
 import subprocess
 import threading
-import time
 from typing import Optional
 
 import numpy as np
+
+_SELECTED_CODEC: Optional[str] = None
+_CODEC_INIT_LOCK = threading.Lock()
 
 
 class AudioVideoWriter:
@@ -30,36 +32,6 @@ class AudioVideoWriter:
 
     def _start_ffmpeg(self, height: int, width: int) -> None:
         """Start FFmpeg once the first frame arrives so dimensions are known."""
-        def _codec_supported(codec: str) -> bool:
-            test_cmd = [
-                self.ffmpeg_binary,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=c=black:s=16x16:r=1",
-                "-frames:v",
-                "1",
-                "-c:v",
-                codec,
-                "-f",
-                "null",
-                "-",
-            ]
-            try:
-                result = subprocess.run(
-                    test_cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    timeout=5,
-                )
-            except Exception:
-                return False
-            if result.returncode == 0:
-                return True
-            return False
 
         base_cmd = [
             self.ffmpeg_binary,
@@ -91,12 +63,16 @@ class AudioVideoWriter:
         ]
 
         codec_candidates = ["libx264", "libopenh264", "h264", "mpeg4"]
+        global _SELECTED_CODEC
+        with _CODEC_INIT_LOCK:
+            if _SELECTED_CODEC and _SELECTED_CODEC in codec_candidates:
+                codec_candidates = [_SELECTED_CODEC] + [
+                    c for c in codec_candidates if c != _SELECTED_CODEC
+                ]
         last_error = ""
         selected_codec: Optional[str] = None
 
         for codec in codec_candidates:
-            if not _codec_supported(codec):
-                continue
             cmd = base_cmd + [
                 "-c:v",
                 codec,
@@ -122,14 +98,10 @@ class AudioVideoWriter:
                 stderr=subprocess.PIPE,
                 bufsize=0,
             )
-
-            # Give FFmpeg a moment to report codec errors before we proceed
-            for _ in range(10):
-                time.sleep(0.05)
-                if proc.poll() is not None:
-                    break
-
-            if proc.poll() is None:
+            # Quick readiness probe: if process stays alive after a short window we keep it.
+            try:
+                proc.wait(timeout=0.15)
+            except subprocess.TimeoutExpired:
                 self.proc = proc
                 selected_codec = codec
                 break
@@ -144,6 +116,9 @@ class AudioVideoWriter:
 
         if not self.proc or not selected_codec:
             raise RuntimeError(f"Failed to start FFmpeg with available codecs. Last error: {last_error}")
+
+        with _CODEC_INIT_LOCK:
+            _SELECTED_CODEC = selected_codec
 
         def _drain_stderr() -> None:
             assert self.proc and self.proc.stderr
