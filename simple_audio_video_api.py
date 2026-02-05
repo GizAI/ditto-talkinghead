@@ -582,3 +582,78 @@ if __name__ == "__main__":
         reload=False,
         workers=1
     )
+
+
+# === DreamTalk-compatible synchronous endpoint ===
+
+@app.post("/inference")
+async def inference_sync(
+    image_file: UploadFile = File(...),
+    wav_file: UploadFile = File(...)
+):
+    """DreamTalk-compatible synchronous inference endpoint.
+    
+    Accepts image_file and wav_file, processes them, and returns the video directly.
+    """
+    import time as _time
+    
+    session_id = str(uuid.uuid4())
+    
+    # Create tmp directory
+    os.makedirs("./tmp", exist_ok=True)
+    
+    # Save uploaded files
+    source_image_path = f"./tmp/source_{session_id}.jpg"
+    audio_path = f"./tmp/audio_{session_id}.wav"
+    
+    source_bytes = await image_file.read()
+    with open(source_image_path, "wb") as f:
+        f.write(source_bytes)
+
+    audio_bytes = await wav_file.read()
+    with open(audio_path, "wb") as f:
+        f.write(audio_bytes)
+    
+    # Load audio
+    audio_buffer = io.BytesIO(audio_bytes)
+    audio, sr = librosa.load(audio_buffer, sr=16000)
+    
+    # Create session
+    session = SimpleAVSession(session_id, source_image_path, audio_path, _STREAM_SDK_MANAGER)
+    sessions[session_id] = session
+    
+    # Start processing
+    session.start_processing(audio)
+    
+    # Wait for completion (with timeout)
+    timeout = 300  # 5 minutes max
+    start = _time.time()
+    while not session.is_complete:
+        if _time.time() - start > timeout:
+            raise HTTPException(status_code=504, detail="Processing timeout")
+        await asyncio.sleep(0.1)
+    
+    # Ensure finalized and return video
+    final_path = session.ensure_finalized()
+    serve_path = final_path if final_path and os.path.exists(final_path) else session.output_path
+    
+    if not os.path.exists(serve_path):
+        raise HTTPException(status_code=500, detail="Video generation failed")
+    
+    # Read and return video data
+    with open(serve_path, "rb") as f:
+        video_data = f.read()
+    
+    # Cleanup session files
+    try:
+        for path in [source_image_path, audio_path, session.output_path]:
+            if os.path.exists(path):
+                os.remove(path)
+        if final_path and os.path.exists(final_path):
+            os.remove(final_path)
+        del sessions[session_id]
+    except Exception:
+        pass
+    
+    from fastapi.responses import Response
+    return Response(content=video_data, media_type="video/mp4")
