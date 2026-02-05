@@ -527,9 +527,13 @@ async def stream_simple(session_id: str, request: Request):
     # Fallback: progressive streaming without Range; keep connection open for live growth.
     def generate_realtime_stream():
         import time as _time
-        min_start_bytes = 128
-        while not os.path.exists(session.output_path) or os.path.getsize(session.output_path) < min_start_bytes:
-            _time.sleep(0.05)  # Wait until ffmpeg emits initial fragment
+        # Wait for at least 5 frames before starting stream (avoid white/blank video)
+        min_frames = 5
+        while session.processed_frames < min_frames and not session.is_complete:
+            _time.sleep(0.05)
+        # Also wait for file to have some content
+        while not os.path.exists(session.output_path) or os.path.getsize(session.output_path) < 1024:
+            _time.sleep(0.05)
 
         last_size = 0
         try:
