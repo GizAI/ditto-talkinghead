@@ -264,21 +264,25 @@ async def inference(
 @app.post("/api/create_simple_session")
 async def create_simple_session(
     source_image: UploadFile = File(...),
-    audio_file: UploadFile = File(...)
+    audio_file: UploadFile = File(...),
+    max_size: int = 1024,
+    sampling_timesteps: int = 50,
+    precision: str = "fp16"
 ):
     """Create streaming session, route to best worker."""
     gpu_id, port = select_best_worker()
-    print(f"[Proxy] Creating session on GPU{gpu_id} (:{port})")
+    print(f"[Proxy] Creating session on GPU{gpu_id} (:{port}) precision={precision}")
 
     image_data = await source_image.read()
     audio_data = await audio_file.read()
 
+    params = f"?max_size={max_size}&sampling_timesteps={sampling_timesteps}&precision={precision}"
     async with httpx.AsyncClient(timeout=30) as client:
         files = {
             "source_image": ("image.png", image_data, "image/png"),
             "audio_file": ("audio.wav", audio_data, "audio/wav"),
         }
-        response = await client.post(f"http://127.0.0.1:{port}/api/create_simple_session", files=files)
+        response = await client.post(f"http://127.0.0.1:{port}/api/create_simple_session{params}", files=files)
 
         if response.status_code != 200:
             raise HTTPException(status_code=response.status_code, detail=response.text)

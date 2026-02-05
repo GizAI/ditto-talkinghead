@@ -14,6 +14,7 @@ from typing import Dict, Optional, Iterator
 import numpy as np
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
+import argparse
 import librosa
 
 # Prefer system ffmpeg with libx264 if available
@@ -72,9 +73,19 @@ class _SharedStreamSDKManager:
                 self._condition.notify()
 
 
+# Parse command line args for engine path
+def _parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-root", default="./checkpoints/ditto_trt_Ampere_Plus",
+                        help="TensorRT engine directory (FP32 or FP16)")
+    return parser.parse_args()
+
+_ARGS = _parse_args()
+print(f"[Worker] Using engine: {_ARGS.data_root}")
+
 _STREAM_SDK_MANAGER = _SharedStreamSDKManager(
     "./checkpoints/ditto_cfg/v0.4_hubert_cfg_trt_online.pkl",
-    "./checkpoints/ditto_trt_Ampere_Plus",
+    _ARGS.data_root,
 )
 # Kick off warmup without blocking startup.
 _STREAM_SDK_MANAGER.ensure_background_warmup()
@@ -372,11 +383,12 @@ async def create_simple_session(
     source_image: UploadFile = File(...),
     audio_file: UploadFile = File(...),
     max_size: int = 1024,
-    sampling_timesteps: int = 50
+    sampling_timesteps: int = 50,
+    precision: str = "fp16"
 ):
     """Create new simple audio+video session"""
     session_id = str(uuid.uuid4())
-    print(f'[Worker] max_size={max_size}, sampling_timesteps={sampling_timesteps}')
+    print(f'[Worker] max_size={max_size}, sampling_timesteps={sampling_timesteps}, precision={precision}')
     
     # Create tmp directory
     os.makedirs("./tmp", exist_ok=True)
