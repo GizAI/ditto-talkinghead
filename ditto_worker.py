@@ -2,7 +2,6 @@
 """
 Simple Audio+Video Streaming API
 Uses modified StreamSDK with built-in audio+video generation
-Supports multi-GPU with automatic load balancing
 """
 
 import io
@@ -10,12 +9,11 @@ import os
 import uuid
 import threading
 import asyncio
-import subprocess
 from contextlib import contextmanager
-from typing import Dict, Optional, Iterator, List
+from typing import Dict, Optional, Iterator
 import numpy as np
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request
-from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse, Response
+from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 import librosa
 
 # Prefer system ffmpeg with libx264 if available
@@ -25,57 +23,22 @@ os.environ.setdefault("FFMPEG_BINARY", "/usr/bin/ffmpeg")
 from stream_pipeline_online import StreamSDK
 
 
-def get_gpu_utilization() -> Dict[int, float]:
-    """Get GPU utilization for each visible GPU using nvidia-smi."""
-    try:
-        result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=index,utilization.gpu', '--format=csv,noheader,nounits'],
-            capture_output=True, text=True, timeout=5
-        )
-        gpu_utils = {}
-        for line in result.stdout.strip().split('\n'):
-            if line:
-                parts = line.split(',')
-                if len(parts) >= 2:
-                    gpu_id = int(parts[0].strip())
-                    util = float(parts[1].strip())
-                    gpu_utils[gpu_id] = util
-        return gpu_utils
-    except Exception as e:
-        print(f"Error getting GPU utilization: {e}")
-        return {}
+class _SharedStreamSDKManager:
+    """Singleton-style helper to reuse a preloaded StreamSDK instance."""
 
-
-class _PerGPUStreamSDKManager:
-    """Manager for a single GPU's StreamSDK instance."""
-
-    def __init__(self, cfg_path: str, data_root: str, gpu_id: int):
+    def __init__(self, cfg_path: str, data_root: str):
         self._cfg_path = cfg_path
         self._data_root = data_root
-        self._gpu_id = gpu_id
         self._sdk: Optional[StreamSDK] = None
         self._lock = threading.Lock()
         self._in_use = False
         self._condition = threading.Condition(self._lock)
         self._warmup_thread: Optional[threading.Thread] = None
 
-    @property
-    def gpu_id(self) -> int:
-        return self._gpu_id
-
-    @property
-    def is_available(self) -> bool:
-        with self._lock:
-            return not self._in_use
-
     def _ensure_initialized(self) -> StreamSDK:
         if self._sdk is None:
-            # Set CUDA device for this SDK instance
-            import torch
-            torch.cuda.set_device(self._gpu_id)
             # Heavy init happens once and is shared across sessions
             self._sdk = StreamSDK(self._cfg_path, self._data_root)
-            print(f"[GPU {self._gpu_id}] StreamSDK initialized")
         return self._sdk
 
     def ensure_background_warmup(self) -> None:
@@ -86,12 +49,10 @@ class _PerGPUStreamSDKManager:
 
         def _warmup() -> None:
             try:
-                # Set CUDA device before warmup
-                import torch
-                torch.cuda.set_device(self._gpu_id)
                 self._ensure_initialized()
             except Exception as exc:
-                print(f"[GPU {self._gpu_id}] StreamSDK warmup failed: {exc}")
+                # Surface during actual acquire; log quietly otherwise
+                print(f"StreamSDK warmup failed: {exc}")
 
         self._warmup_thread = threading.Thread(target=_warmup, daemon=True)
         self._warmup_thread.start()
@@ -101,9 +62,6 @@ class _PerGPUStreamSDKManager:
         with self._condition:
             while self._in_use:
                 self._condition.wait()
-            # Set CUDA device before use
-            import torch
-            torch.cuda.set_device(self._gpu_id)
             sdk = self._ensure_initialized()
             self._in_use = True
         try:
@@ -114,79 +72,17 @@ class _PerGPUStreamSDKManager:
                 self._condition.notify()
 
 
-class _MultiGPUStreamSDKManager:
-    """Manager that handles multiple GPUs with load balancing."""
-
-    def __init__(self, cfg_path: str, data_root: str, gpu_ids: List[int]):
-        self._cfg_path = cfg_path
-        self._data_root = data_root
-        self._gpu_ids = gpu_ids
-        self._managers: Dict[int, _PerGPUStreamSDKManager] = {}
-
-        for gpu_id in gpu_ids:
-            self._managers[gpu_id] = _PerGPUStreamSDKManager(cfg_path, data_root, gpu_id)
-
-        print(f"MultiGPU Manager initialized with GPUs: {gpu_ids}")
-
-    def ensure_background_warmup(self) -> None:
-        """Warm up all GPU managers in background."""
-        for manager in self._managers.values():
-            manager.ensure_background_warmup()
-
-    def get_best_manager(self) -> _PerGPUStreamSDKManager:
-        """Get the best available GPU manager based on availability and utilization."""
-        # First, check for immediately available managers
-        available_managers = [m for m in self._managers.values() if m.is_available]
-
-        if not available_managers:
-            # All busy, pick based on GPU utilization (will wait)
-            gpu_utils = get_gpu_utilization()
-            best_gpu = min(self._gpu_ids, key=lambda g: gpu_utils.get(g, 100))
-            print(f"All GPUs busy, queuing on GPU {best_gpu} (util: {gpu_utils.get(best_gpu, 'N/A')}%)")
-            return self._managers[best_gpu]
-
-        if len(available_managers) == 1:
-            return available_managers[0]
-
-        # Multiple available, pick least utilized
-        gpu_utils = get_gpu_utilization()
-        best_manager = min(
-            available_managers,
-            key=lambda m: gpu_utils.get(m.gpu_id, 100)
-        )
-        print(f"Selected GPU {best_manager.gpu_id} (util: {gpu_utils.get(best_manager.gpu_id, 'N/A')}%)")
-        return best_manager
-
-    @contextmanager
-    def acquire(self) -> Iterator[StreamSDK]:
-        """Acquire SDK from the best available GPU."""
-        manager = self.get_best_manager()
-        with manager.acquire() as sdk:
-            yield sdk
-
-
-# Parse GPU IDs from environment
-def _parse_gpu_ids() -> List[int]:
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
-    if cuda_visible:
-        return [int(x.strip()) for x in cuda_visible.split(",") if x.strip()]
-    return [0]
-
-
-_GPU_IDS = _parse_gpu_ids()
-_STREAM_SDK_MANAGER = _MultiGPUStreamSDKManager(
+_STREAM_SDK_MANAGER = _SharedStreamSDKManager(
     "./checkpoints/ditto_cfg/v0.4_hubert_cfg_trt_online.pkl",
     "./checkpoints/ditto_trt_Ampere_Plus",
-    _GPU_IDS,
 )
 # Kick off warmup without blocking startup.
 _STREAM_SDK_MANAGER.ensure_background_warmup()
 
-app = FastAPI(title="Simple Audio+Video Streaming API (Multi-GPU)")
+app = FastAPI(title="Simple Audio+Video Streaming API")
 
 # Global sessions storage
 sessions: Dict[str, "SimpleAVSession"] = {}
-
 
 class SimpleAVSession:
     def __init__(
@@ -194,16 +90,20 @@ class SimpleAVSession:
         session_id: str,
         source_image_path: str,
         audio_path: str,
-        sdk_manager: _MultiGPUStreamSDKManager,
+        sdk_manager: _SharedStreamSDKManager,
+        max_size: int = 1024,
+    sampling_timesteps: int = 50
     ) -> None:
         self.session_id = session_id
         self.source_image_path = source_image_path
         self.audio_path = audio_path
         self._sdk_manager = sdk_manager
+        self.max_size = max_size
+        self.sampling_timesteps = sampling_timesteps
 
         # Output path (will contain audio+video)
         self.output_path = f"./tmp/av_{session_id}.mp4"
-
+        
         # State
         self.is_processing = False
         self.is_complete = False
@@ -211,16 +111,15 @@ class SimpleAVSession:
         self.total_frames = 0
         self._finalize_lock = threading.Lock()
         self.final_path: Optional[str] = None
-        self.gpu_id: Optional[int] = None
-
+        
         # SDK
         self.sdk: Optional[StreamSDK] = None
-
+        
     def start_processing(self, audio: np.ndarray):
         """Start processing with built-in audio+video generation"""
         if self.is_processing:
             return
-
+            
         self.is_processing = True
         self.total_frames = len(audio) // 640  # Estimate frames
 
@@ -228,7 +127,7 @@ class SimpleAVSession:
         thread = threading.Thread(target=self._process_with_builtin_audio, args=(audio,))
         thread.daemon = True
         thread.start()
-
+        
     def ensure_finalized(self) -> Optional[str]:
         if self.final_path and os.path.exists(self.final_path):
             return self.final_path
@@ -244,6 +143,8 @@ class SimpleAVSession:
                 return None
 
             try:
+                import subprocess
+
                 candidate = self.output_path.replace('.mp4', '.final.mp4')
                 cmd = [
                     'ffmpeg', '-v', 'error', '-y',
@@ -263,18 +164,13 @@ class SimpleAVSession:
         try:
             setup_kwargs = {
                 "online_mode": True,
-                "sampling_timesteps": 50,
+                "sampling_timesteps": self.sampling_timesteps,
                 "overlap_v2": 70,
                 "smo_k_d": 3,
-                "max_size": 1024,
+                "max_size": self.max_size,
             }
 
-            # Get the best available GPU manager
-            gpu_manager = self._sdk_manager.get_best_manager()
-            self.gpu_id = gpu_manager.gpu_id
-            print(f"[Session {self.session_id[:8]}] Using GPU {self.gpu_id}")
-
-            with gpu_manager.acquire() as sdk:
+            with self._sdk_manager.acquire() as sdk:
                 self.sdk = sdk
 
                 # Setup SDK with audio path for built-in audio+video generation
@@ -338,14 +234,12 @@ class SimpleAVSession:
                     pass
 
             self.is_complete = True
-            print(f"[Session {self.session_id[:8]}] Complete on GPU {self.gpu_id}")
 
         except Exception as e:
-            print(f"[Session {self.session_id[:8]}] Error: {e}")
+            print(f"Error in audio+video processing: {e}")
         finally:
             self.is_processing = False
             self.sdk = None
-
 
 @app.get("/", response_class=HTMLResponse)
 async def get_client():
@@ -365,22 +259,21 @@ async def get_client():
         </style>
     </head>
     <body>
-        <h1>🎭 Simple Audio+Video Streaming (Multi-GPU)</h1>
-
+        <h1>🎭 Simple Audio+Video Streaming</h1>
+        
         <div class="upload-section">
             <h3>📁 Upload Files</h3>
             <input type="file" id="sourceImage" class="file-input" accept="image/*" placeholder="Source Image">
             <input type="file" id="audioFile" class="file-input" accept="audio/*" placeholder="Audio File">
             <button class="btn" onclick="createSession()">🚀 Generate Audio+Video</button>
         </div>
-
+        
         <div id="status" class="status" style="display: none;">
             <h3>📊 Status</h3>
             <p id="statusText">Processing...</p>
             <p id="progressText">Frames: 0 / 0</p>
-            <p id="gpuText">GPU: -</p>
         </div>
-
+        
         <div id="result" style="display: none;">
             <h3>🎬 Result</h3>
             <p id="resultText">Video ready!</p>
@@ -421,7 +314,7 @@ async def get_client():
             }
 
             function startStatusMonitoring() {
-                window.streamStarted = false;
+                window.streamStarted = false; // Reset streaming flag
                 statusInterval = setInterval(async () => {
                     if (!currentSessionId) return;
 
@@ -429,28 +322,29 @@ async def get_client():
                         const response = await fetch(`/api/status_simple/${currentSessionId}`);
                         const status = await response.json();
 
-                        document.getElementById('progressText').textContent =
+                        document.getElementById('progressText').textContent = 
                             `Frames: ${status.processed_frames} / ${status.total_frames}`;
-                        document.getElementById('gpuText').textContent =
-                            `GPU: ${status.gpu_id !== null ? status.gpu_id : 'pending'}`;
 
                         if (status.is_complete) {
                             document.getElementById('statusText').textContent = 'Complete!';
                             document.getElementById('result').style.display = 'block';
 
+                            // If streaming hasn't started yet, open it now
                             if (!window.streamStarted) {
                                 const videoUrl = `/api/stream_simple/${currentSessionId}`;
                                 window.open(videoUrl, '_blank');
                             }
 
                             document.getElementById('resultText').innerHTML =
-                                `<p>✅ Processing complete on GPU ${status.gpu_id}!</p>
+                                `<p>✅ Processing complete! Final high-quality video ready.</p>
                                  <a href="/api/download_simple/${currentSessionId}" target="_blank">📥 Download MP4</a>`;
 
                             clearInterval(statusInterval);
                         } else if (status.is_processing) {
                             document.getElementById('statusText').textContent = 'Generating audio+video...';
 
+                            // Start streaming as soon as we have some content (after ~1 frame)
+                            console.log('Status:', status.processed_frames, 'frames, streamStarted:', window.streamStarted);
                             if (status.processed_frames >= 1 && !window.streamStarted) {
                                 window.streamStarted = true;
                                 const videoUrl = `/api/stream_simple/${currentSessionId}`;
@@ -458,7 +352,8 @@ async def get_client():
 
                                 document.getElementById('result').style.display = 'block';
                                 document.getElementById('resultText').innerHTML =
-                                    `<p>🎬 Real-time streaming started!</p>`;
+                                    `<p>🎬 Real-time streaming started in new tab!</p>
+                                     <p>Video will continue updating as processing completes...</p>`;
                             }
                         }
                     } catch (error) {
@@ -472,37 +367,24 @@ async def get_client():
     """
     return HTMLResponse(content=html_content)
 
-
-@app.get("/api/gpu_status")
-async def get_gpu_status():
-    """Get current GPU status and availability."""
-    gpu_utils = get_gpu_utilization()
-    status = []
-    for gpu_id in _GPU_IDS:
-        manager = _STREAM_SDK_MANAGER._managers.get(gpu_id)
-        status.append({
-            "gpu_id": gpu_id,
-            "utilization": gpu_utils.get(gpu_id, -1),
-            "available": manager.is_available if manager else False,
-        })
-    return {"gpus": status}
-
-
 @app.post("/api/create_simple_session")
 async def create_simple_session(
     source_image: UploadFile = File(...),
-    audio_file: UploadFile = File(...)
+    audio_file: UploadFile = File(...),
+    max_size: int = 1024,
+    sampling_timesteps: int = 50
 ):
     """Create new simple audio+video session"""
     session_id = str(uuid.uuid4())
-
+    print(f'[Worker] max_size={max_size}, sampling_timesteps={sampling_timesteps}')
+    
     # Create tmp directory
     os.makedirs("./tmp", exist_ok=True)
-
+    
     # Save uploaded files
     source_image_path = f"./tmp/source_{session_id}.jpg"
     audio_path = f"./tmp/audio_{session_id}.wav"
-
+    
     source_bytes = await source_image.read()
     with open(source_image_path, "wb") as f:
         f.write(source_bytes)
@@ -510,43 +392,39 @@ async def create_simple_session(
     audio_bytes = await audio_file.read()
     with open(audio_path, "wb") as f:
         f.write(audio_bytes)
-
+    
     # Load audio
     audio_buffer = io.BytesIO(audio_bytes)
     audio, sr = librosa.load(audio_buffer, sr=16000)
-
+    
     # Create session
-    session = SimpleAVSession(session_id, source_image_path, audio_path, _STREAM_SDK_MANAGER)
+    session = SimpleAVSession(session_id, source_image_path, audio_path, _STREAM_SDK_MANAGER, max_size, sampling_timesteps)
     sessions[session_id] = session
-
+    
     # Start processing
     session.start_processing(audio)
-
+    
     return {
         "session_id": session_id,
-        "status": "processing_started",
-        "available_gpus": len(_GPU_IDS)
+        "status": "processing_started"
     }
-
 
 @app.get("/api/status_simple/{session_id}")
 async def get_simple_status(session_id: str):
     """Get simple session status"""
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
-
+    
     session = sessions[session_id]
-
+    
     return {
         "session_id": session_id,
         "is_processing": session.is_processing,
         "is_complete": session.is_complete,
         "processed_frames": session.processed_frames,
         "total_frames": session.total_frames,
-        "gpu_id": session.gpu_id,
         "output_size": os.path.getsize(session.output_path) if os.path.exists(session.output_path) else 0
     }
-
 
 @app.get("/api/stream_simple/{session_id}")
 async def stream_simple(session_id: str, request: Request):
@@ -559,6 +437,7 @@ async def stream_simple(session_id: str, request: Request):
     # Parse Range header if present (e.g., bytes=12345-)
     range_header = request.headers.get('range')
     if range_header and not session.is_complete:
+        # Live sessions keep the connection open; browsers fall back to progressive streaming.
         range_header = None
     range_start = 0
     range_end_requested: Optional[int] = None
@@ -574,6 +453,7 @@ async def stream_simple(session_id: str, request: Request):
             range_start = 0
             range_end_requested = None
 
+    # If a Range request is present, comply with 206 responses so browsers can buffer correctly.
     if range_header:
         serve_path = session.ensure_finalized() or session.output_path
         if not os.path.exists(serve_path):
@@ -589,7 +469,7 @@ async def stream_simple(session_id: str, request: Request):
                         return current_size
                 if session.is_complete and not os.path.exists(serve_path):
                     return 0
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.05)  # Check more frequently
 
         available_size = await _wait_for_bytes(range_start)
         if available_size <= range_start:
@@ -608,7 +488,7 @@ async def stream_simple(session_id: str, request: Request):
             with open(serve_path, 'rb') as f:
                 f.seek(range_start)
                 remaining = bytes_to_send
-                chunk_size = 8 * 1024
+                chunk_size = 8 * 1024  # Smaller chunks for faster streaming
                 while remaining > 0:
                     chunk = f.read(min(chunk_size, remaining))
                     if not chunk:
@@ -632,11 +512,12 @@ async def stream_simple(session_id: str, request: Request):
             headers=headers,
         )
 
+    # Fallback: progressive streaming without Range; keep connection open for live growth.
     def generate_realtime_stream():
         import time as _time
         min_start_bytes = 128
         while not os.path.exists(session.output_path) or os.path.getsize(session.output_path) < min_start_bytes:
-            _time.sleep(0.05)
+            _time.sleep(0.05)  # Wait until ffmpeg emits initial fragment
 
         last_size = 0
         try:
@@ -656,6 +537,7 @@ async def stream_simple(session_id: str, request: Request):
 
                     _time.sleep(0.05)
         except Exception:
+            # swallow transient streaming errors; client may close early
             return
 
     headers = {
@@ -670,7 +552,6 @@ async def stream_simple(session_id: str, request: Request):
         headers=headers,
     )
 
-
 @app.get("/api/download_simple/{session_id}")
 async def download_simple(session_id: str):
     """Download generated audio+video file"""
@@ -679,6 +560,7 @@ async def download_simple(session_id: str):
 
     session = sessions[session_id]
 
+    # Prefer a remuxed MP4 with faststart; create on-demand if missing.
     final_path = session.ensure_finalized()
     serve_path = final_path if final_path and os.path.exists(final_path) else session.output_path
 
@@ -691,6 +573,23 @@ async def download_simple(session_id: str):
         filename=f"generated_{session_id}.mp4"
     )
 
+if __name__ == "__main__":
+    import uvicorn
+
+    # Get configuration from environment variables
+    port = int(os.environ.get("DITTO_PORT", "8010"))
+    gpu_id = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+
+    print(f"Starting Ditto TalkingHead API on port {port} with GPU {gpu_id}")
+
+    uvicorn.run(
+        "ditto_worker:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,
+        workers=1
+    )
+
 
 # === DreamTalk-compatible synchronous endpoint ===
 
@@ -700,21 +599,21 @@ async def inference_sync(
     wav_file: UploadFile = File(...)
 ):
     """DreamTalk-compatible synchronous inference endpoint.
-
+    
     Accepts image_file and wav_file, processes them, and returns the video directly.
-    Automatically uses the least busy GPU.
     """
     import time as _time
-
+    
     session_id = str(uuid.uuid4())
-
+    print(f'[Worker] max_size={max_size}, sampling_timesteps={sampling_timesteps}')
+    
     # Create tmp directory
     os.makedirs("./tmp", exist_ok=True)
-
+    
     # Save uploaded files
     source_image_path = f"./tmp/source_{session_id}.jpg"
     audio_path = f"./tmp/audio_{session_id}.wav"
-
+    
     source_bytes = await image_file.read()
     with open(source_image_path, "wb") as f:
         f.write(source_bytes)
@@ -722,18 +621,18 @@ async def inference_sync(
     audio_bytes = await wav_file.read()
     with open(audio_path, "wb") as f:
         f.write(audio_bytes)
-
+    
     # Load audio
     audio_buffer = io.BytesIO(audio_bytes)
     audio, sr = librosa.load(audio_buffer, sr=16000)
-
+    
     # Create session
-    session = SimpleAVSession(session_id, source_image_path, audio_path, _STREAM_SDK_MANAGER)
+    session = SimpleAVSession(session_id, source_image_path, audio_path, _STREAM_SDK_MANAGER, max_size, sampling_timesteps)
     sessions[session_id] = session
-
+    
     # Start processing
     session.start_processing(audio)
-
+    
     # Wait for completion (with timeout)
     timeout = 300  # 5 minutes max
     start = _time.time()
@@ -741,18 +640,18 @@ async def inference_sync(
         if _time.time() - start > timeout:
             raise HTTPException(status_code=504, detail="Processing timeout")
         await asyncio.sleep(0.1)
-
+    
     # Ensure finalized and return video
     final_path = session.ensure_finalized()
     serve_path = final_path if final_path and os.path.exists(final_path) else session.output_path
-
+    
     if not os.path.exists(serve_path):
         raise HTTPException(status_code=500, detail="Video generation failed")
-
+    
     # Read and return video data
     with open(serve_path, "rb") as f:
         video_data = f.read()
-
+    
     # Cleanup session files
     try:
         for path in [source_image_path, audio_path, session.output_path]:
@@ -763,22 +662,6 @@ async def inference_sync(
         del sessions[session_id]
     except Exception:
         pass
-
+    
+    from fastapi.responses import Response
     return Response(content=video_data, media_type="video/mp4")
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    port = int(os.environ.get("DITTO_PORT", "8010"))
-    gpu_ids = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
-
-    print(f"Starting Ditto TalkingHead API on port {port} with GPUs: {gpu_ids}")
-
-    uvicorn.run(
-        "simple_audio_video_api:app",
-        host="0.0.0.0",
-        port=port,
-        reload=False,
-        workers=1
-    )

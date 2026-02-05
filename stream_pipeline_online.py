@@ -1,9 +1,11 @@
 import os
+import hashlib
 import threading
 import queue
 import numpy as np
 import traceback
 from tqdm import tqdm
+from functools import lru_cache
 
 from core.atomic_components.avatar_registrar import AvatarRegistrar, smooth_x_s_info_lst
 from core.atomic_components.condition_handler import ConditionHandler, _mirror_index
@@ -66,11 +68,23 @@ class StreamSDK:
 
         self.wav2feat = Wav2Feat(**wav2feat_cfg)
 
+        # Face embedding cache (LRU with max 32 entries)
+        self._source_info_cache = {}
+        self._cache_max_size = 32
+        self._cache_lock = threading.Lock()
+
     def _merge_kwargs(self, default_kwargs, run_kwargs):
         for k, v in default_kwargs.items():
             if k not in run_kwargs:
                 run_kwargs[k] = v
         return run_kwargs
+
+    def _get_source_cache_key(self, source_path, max_size, n_frames, crop_kwargs):
+        """Generate cache key from image file hash + parameters."""
+        with open(source_path, 'rb') as f:
+            file_hash = hashlib.md5(f.read()).hexdigest()
+        param_str = f"{max_size}_{n_frames}_{crop_kwargs}"
+        return f"{file_hash}_{hashlib.md5(param_str.encode()).hexdigest()[:8]}"
 
     def setup_Nd(self, N_d, fade_in=-1, fade_out=-1, ctrl_info=None):
         # for eye open at video end
@@ -161,7 +175,7 @@ class StreamSDK:
         # only hubert support online mode
         assert self.wav2feat.support_streaming or not self.online_mode
 
-        # ======== Register Avatar ========
+        # ======== Register Avatar (with caching) ========
         crop_kwargs = {
             "crop_scale": self.crop_scale,
             "crop_vx_ratio": self.crop_vx_ratio,
@@ -169,15 +183,31 @@ class StreamSDK:
             "crop_flag_do_rot": self.crop_flag_do_rot,
         }
         n_frames = self.template_n_frames if self.template_n_frames > 0 else self.N_d
-        source_info = self.avatar_registrar(
-            source_path, 
-            max_dim=self.max_size, 
-            n_frames=n_frames, 
-            **crop_kwargs,
-        )
 
-        if len(source_info["x_s_info_lst"]) > 1 and self.smo_k_s > 1:
-            source_info["x_s_info_lst"] = smooth_x_s_info_lst(source_info["x_s_info_lst"], smo_k=self.smo_k_s)
+        # Generate cache key from image content + params
+        cache_key = self._get_source_cache_key(source_path, self.max_size, n_frames, crop_kwargs)
+
+        with self._cache_lock:
+            if cache_key in self._source_info_cache:
+                source_info = self._source_info_cache[cache_key]
+                print(f"[Cache HIT] Using cached face embedding for {os.path.basename(source_path)}")
+            else:
+                source_info = self.avatar_registrar(
+                    source_path,
+                    max_dim=self.max_size,
+                    n_frames=n_frames,
+                    **crop_kwargs,
+                )
+                if len(source_info["x_s_info_lst"]) > 1 and self.smo_k_s > 1:
+                    source_info["x_s_info_lst"] = smooth_x_s_info_lst(source_info["x_s_info_lst"], smo_k=self.smo_k_s)
+
+                # LRU eviction
+                if len(self._source_info_cache) >= self._cache_max_size:
+                    oldest_key = next(iter(self._source_info_cache))
+                    del self._source_info_cache[oldest_key]
+
+                self._source_info_cache[cache_key] = source_info
+                print(f"[Cache MISS] Cached face embedding for {os.path.basename(source_path)}")
 
         self.source_info = source_info
         self.source_info_frames = len(source_info["x_s_info_lst"])
