@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 User=user
 Group=user
-WorkingDirectory=/home/user/Projects/ditto-talkinghead
+WorkingDirectory=/home/user/ditto-talkinghead
 Environment=PATH=/home/user/miniconda3/envs/ditto/bin:/usr/local/bin:/usr/bin:/bin
 Environment=CONDA_DEFAULT_ENV=ditto
 Environment=CONDA_PREFIX=/home/user/miniconda3/envs/ditto

@@ -621,6 +621,8 @@ async def inference_sync(
     import time as _time
     
     session_id = str(uuid.uuid4())
+    max_size = 1024
+    sampling_timesteps = 50
     print(f'[Worker] max_size={max_size}, sampling_timesteps={sampling_timesteps}')
     
     # Create tmp directory
