@@ -277,7 +277,7 @@ async def create_simple_session(
     audio_data = await audio_file.read()
 
     params = f"?max_size={max_size}&sampling_timesteps={sampling_timesteps}&precision={precision}"
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=300) as client:
         files = {
             "source_image": ("image.png", image_data, "image/png"),
             "audio_file": ("audio.wav", audio_data, "audio/wav"),
