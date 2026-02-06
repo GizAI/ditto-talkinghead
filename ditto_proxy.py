@@ -76,8 +76,9 @@ def start_worker(gpu_id: int, port: int) -> subprocess.Popen:
         [PYTHON_PATH, WORKER_SCRIPT],
         cwd=WORK_DIR,
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stdout=None,
+        stderr=None,
+        preexec_fn=os.setsid,
     )
     print(f"[Proxy] Started worker GPU{gpu_id} on port {port} (PID: {proc.pid})")
     return proc
@@ -88,10 +89,18 @@ def stop_workers():
     for gpu_id, proc in workers.items():
         if proc and proc.poll() is None:
             print(f"[Proxy] Stopping worker GPU{gpu_id} (PID: {proc.pid})")
-            proc.terminate()
             try:
-                proc.wait(timeout=5)
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
+                print(f"[Proxy] Force killing worker GPU{gpu_id}")
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
                 proc.kill()
 
 

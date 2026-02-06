@@ -75,7 +75,7 @@ Environment=CONDA_DEFAULT_ENV=ditto
 Environment=CONDA_PREFIX=$CONDA_ENV_PATH
 Environment=DITTO_PORT=$PORT
 Environment=CUDA_VISIBLE_DEVICES=$GPU_ID
-ExecStart=$CONDA_ENV_PATH/bin/python simple_audio_video_api.py
+ExecStart=$CONDA_ENV_PATH/bin/python ditto_proxy.py
 Restart=always
 RestartSec=10
 StandardOutput=journal
