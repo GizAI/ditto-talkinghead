@@ -10,7 +10,7 @@ WorkingDirectory=/home/user/Projects/ditto-talkinghead
 Environment=PATH=/home/user/miniconda3/envs/ditto/bin:/usr/local/bin:/usr/bin:/bin
 Environment=CONDA_DEFAULT_ENV=ditto
 Environment=CONDA_PREFIX=/home/user/miniconda3/envs/ditto
-Environment=DITTO_PORT=8010
+Environment=DITTO_PORT=5097
 Environment=CUDA_VISIBLE_DEVICES=0
 ExecStart=/home/user/miniconda3/envs/ditto/bin/python ditto_proxy.py
 Restart=always
