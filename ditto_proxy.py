@@ -84,24 +84,31 @@ def start_worker(gpu_id: int, port: int) -> subprocess.Popen:
     return proc
 
 
+def stop_worker(gpu_id: int):
+    """Stop one worker process."""
+    proc = workers.get(gpu_id)
+    if not proc or proc.poll() is not None:
+        return
+    print(f"[Proxy] Stopping worker GPU{gpu_id} (PID: {proc.pid})")
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        print(f"[Proxy] Force killing worker GPU{gpu_id}")
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        proc.kill()
+
+
 def stop_workers():
     """Stop all worker processes."""
-    for gpu_id, proc in workers.items():
-        if proc and proc.poll() is None:
-            print(f"[Proxy] Stopping worker GPU{gpu_id} (PID: {proc.pid})")
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                pass
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                print(f"[Proxy] Force killing worker GPU{gpu_id}")
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-                proc.kill()
+    for gpu_id in list(workers):
+        stop_worker(gpu_id)
 
 
 @app.on_event("startup")
@@ -135,20 +142,43 @@ async def shutdown():
     stop_workers()
 
 
-def select_best_worker() -> tuple:
-    """Select worker with lowest GPU utilization. Returns (gpu_id, port)."""
-    stats = get_gpu_utilization()
+async def ensure_worker_healthy(gpu_id: int, port: int) -> bool:
+    """Ensure worker process is running and healthy."""
+    proc = workers.get(gpu_id)
+    if not proc or proc.poll() is not None:
+        workers[gpu_id] = start_worker(gpu_id, port)
 
-    best_gpu = 0
-    best_util = float('inf')
+    if await check_worker_health(port):
+        return True
+
+    print(f"[Proxy] Worker GPU{gpu_id} unhealthy on :{port}, restarting")
+    stop_worker(gpu_id)
+    workers[gpu_id] = start_worker(gpu_id, port)
+
+    for _ in range(20):
+        await asyncio.sleep(1)
+        if await check_worker_health(port):
+            return True
+
+    print(f"[Proxy] Worker GPU{gpu_id} failed to recover on :{port}")
+    return False
+
+
+async def select_best_worker() -> tuple:
+    """Select the healthiest worker with lowest GPU utilization."""
+    stats = get_gpu_utilization()
+    candidates = []
 
     for gpu_id, port in WORKER_PORTS.items():
-        util = stats.get(gpu_id, {}).get("util", 100)
-        if util < best_util:
-            best_util = util
-            best_gpu = gpu_id
+        if await ensure_worker_healthy(gpu_id, port):
+            util = stats.get(gpu_id, {}).get("util", 100)
+            candidates.append((util, gpu_id, port))
 
-    return best_gpu, WORKER_PORTS[best_gpu]
+    if not candidates:
+        raise HTTPException(status_code=503, detail="No healthy Ditto workers available")
+
+    _, gpu_id, port = min(candidates)
+    return gpu_id, port
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -241,7 +271,7 @@ async def inference(
     wav_file: UploadFile = File(...)
 ):
     """Route inference to best worker."""
-    gpu_id, port = select_best_worker()
+    gpu_id, port = await select_best_worker()
     print(f"[Proxy] Routing to GPU{gpu_id} (:{port})")
 
     image_data = await image_file.read()
@@ -279,7 +309,7 @@ async def create_simple_session(
     precision: str = "fp16"
 ):
     """Create streaming session, route to best worker."""
-    gpu_id, port = select_best_worker()
+    gpu_id, port = await select_best_worker()
     print(f"[Proxy] Creating session on GPU{gpu_id} (:{port}) precision={precision}")
 
     image_data = await source_image.read()
@@ -377,7 +407,7 @@ if __name__ == "__main__":
 
     print(f"[Proxy] Starting Ditto Service")
     uvicorn.run(
-        "ditto_proxy:app",
+        app,
         host="0.0.0.0",
         port=PROXY_PORT,
         reload=False,
